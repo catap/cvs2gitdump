@@ -12,10 +12,8 @@ Pros:
 - Small footprint
 - Supports incremental import.  It's very fast
 - Converts tags on HEAD
+- Converts all tags and CVS branches to Git branches with `-A`
 - Everything is done in memory
-
-Cons:
-- Doesn't convert any branches
 
 An alternative to
 - [git-cvs](https://github.com/ustuehler/git-cvs)
@@ -29,8 +27,9 @@ Prerequisite:
 Usage
 -----
 
-    usage: cvs2gitdump [-ah] [-z fuzz] [-e email_domain] [-E log_encodings]
-        [-k rcs_keywords] [-b branch] [-m module] [-l last_revision]
+    usage: cvs2gitdump [-aAh] [-z fuzz] [-e email_domain]
+        [-E log_encodings] [-k rcs_keywords] [-b branch]
+        [-m module] [-l last_revision]
 	cvsroot [git_dir]
 
 
@@ -43,10 +42,15 @@ Usage
   repository is changing.  This option will change this behavior, it
   will use the entire commits.
 
+* -A
+
+  Convert all tags and CVS branches.
+
 * -b branch
 
   The branch name of the git repository which is used for incremental
-  import.
+  import.  With -A, this branch is used as the Git target for HEAD/VENDOR
+  history.
 
 * -h
 

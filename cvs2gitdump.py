@@ -42,8 +42,8 @@ CHANGESET_FUZZ_SEC = 300
 
 
 def usage():
-    print('usage: cvs2gitdump [-ah] [-z fuzz] [-e email_domain] '
-          '[-E log_encodings]\n'
+    print('usage: cvs2gitdump [-aAh] [-z fuzz] [-e email_domain]\n'
+          '\t[-E log_encodings]\n'
           '\t[-k rcs_keywords] [-b branch] [-m module] [-l last_revision]\n'
           '\tcvsroot [git_dir]', file=sys.stderr)
 
@@ -59,9 +59,14 @@ def main():
     modules = []
     last_revision = None
     fuzzsec = CHANGESET_FUZZ_SEC
+    convert_all = False
+    existing_branches = set()
+    existing_refs = set()
+    branch_sources = dict()
+    tag_sources = dict()
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:], 'ab:hm:z:e:E:k:t:l:')
+        opts, args = getopt.getopt(sys.argv[1:], 'aAb:hm:z:e:E:k:t:l:')
         for opt, v in opts:
             if opt == '-z':
                 fuzzsec = int(v)
@@ -83,6 +88,8 @@ def main():
                 modules.append(v)
             elif opt == '-l':
                 last_revision = v
+            elif opt == '-A':
+                convert_all = True
             elif opt == '-h':
                 usage()
                 sys.exit(1)
@@ -135,7 +142,21 @@ def main():
                 last_author.lower().endswith(('@' + email_domain).lower()):
             last_author = last_author[:-1 * (1 + len(email_domain))]
 
-    cvs = CvsConv(cvsroot, rcs, not do_incremental, fuzzsec)
+        git = subprocess.Popen(
+            ['git', '--git-dir=' + args[1], 'for-each-ref',
+             '--format=%(refname)', 'refs/heads', 'refs/tags'],
+            encoding='utf-8', stdout=subprocess.PIPE)
+        existing_refs = set([r.strip() for r in git.stdout.readlines()])
+        git.wait()
+        if git.returncode != 0:
+            print("Couldn't exec git", file=sys.stderr)
+            sys.exit(git.returncode)
+        existing_branches = set([
+            r[len('refs/heads/'):] for r in existing_refs
+            if r.startswith('refs/heads/')
+        ])
+
+    cvs = CvsConv(cvsroot, rcs, not do_incremental, fuzzsec, convert_all)
     print('** walk cvs tree', file=sys.stderr)
     if len(modules) == 0:
         cvs.walk()
@@ -150,6 +171,15 @@ def main():
     if nchangesets <= 0:
         sys.exit(0)
 
+    if do_incremental and convert_all:
+        commits = git_commit_map(args[1], git_branch, email_domain)
+        branch_sources = git_branch_sources(
+            args[1], git_branch, cvs, existing_refs, existing_branches,
+            commits, log_encodings)
+        tag_sources = git_tag_sources(
+            args[1], git_branch, cvs, existing_refs, existing_branches,
+            commits, log_encodings, last_ctime)
+
     if not dump_all:
         # don't use last 10 minutes for safety
         max_time_max = changesets[-1].max_time - 600
@@ -159,8 +189,13 @@ def main():
     found_last_revision = False
     markseq = cvs.markseq
     extags = set()
+    commit_marks = dict()
+    initialized_branches = set(existing_branches)
     for k in changesets:
-        if do_incremental and not found_last_revision:
+        if do_incremental and is_cvs_branch(k.branch):
+            if k.branch in existing_branches:
+                continue
+        elif do_incremental and not found_last_revision:
             if k.min_time == last_ctime and k.author == last_author:
                 found_last_revision = True
             for tag in k.tags:
@@ -168,6 +203,13 @@ def main():
             continue
         if k.max_time > max_time_max:
             break
+
+        branch_source = None
+        if do_incremental and is_cvs_branch(k.branch):
+            branch_source = cvs_branch_source(
+                k.branch, cvs, commit_marks, existing_refs, branch_sources)
+            if branch_source is None:
+                continue
 
         marks = {}
 
@@ -179,18 +221,20 @@ def main():
                 git_dump_file(f.path, f.rev, rcs, markseq)
                 marks[markseq] = f
         log = rcsparse.rcsfile(k.revs[0].path).getlog(k.revs[0].rev)
-        for i, e in enumerate(log_encodings):
-            try:
-                how = 'ignore' if i == len(log_encodings) - 1 else 'strict'
-                log = log.decode(e, how)
-                break
-            except UnicodeError:
-                pass
-        log = log.encode('utf-8', 'ignore')
+        log = decode_log(log, log_encodings).encode('utf-8', 'ignore')
 
-        output('commit refs/heads/' + git_branch)
+        if is_cvs_branch(k.branch):
+            if branch_source is None:
+                branch_source = cvs_branch_source(
+                    k.branch, cvs, commit_marks, existing_refs, branch_sources)
+            if branch_source is None:
+                continue
+            reset_branch(k.branch, branch_source, initialized_branches)
+
+        output('commit ' + git_ref(k.branch, git_branch))
         markseq = markseq + 1
         output('mark :%d' % (markseq))
+        commit_marks[k] = markseq
         email = k.author if email_domain is None \
             else k.author + '@' + email_domain
         output('author %s <%s> %d +0000' % (k.author, email, k.min_time))
@@ -198,7 +242,8 @@ def main():
 
         output('data', len(log))
         output(log, end='')
-        if do_incremental and git_tip is not None:
+        if do_incremental and git_tip is not None and \
+                not is_cvs_branch(k.branch):
             output('from', git_tip)
             git_tip = None
 
@@ -217,6 +262,18 @@ def main():
             output('reset refs/tags/%s' % (tag))
             output('from :%d' % (markseq))
             output('')
+        for branch, base in list(cvs.branch_bases.items()):
+            if base is k:
+                source = cvs_branch_source(
+                    branch, cvs, commit_marks, existing_refs, branch_sources)
+                if source is not None:
+                    reset_branch(branch, source, initialized_branches)
+
+    if do_incremental:
+        for tag, source in list(tag_sources.items()):
+            reset_tag(tag, source)
+        for branch, source in list(branch_sources.items()):
+            reset_branch(branch, source, initialized_branches)
 
     if do_incremental and not found_last_revision:
         raise Exception('could not find the last revision')
@@ -332,14 +389,16 @@ def _cmp2(a, b):
 
 
 class CvsConv:
-    def __init__(self, cvsroot, rcs, dumpfile, fuzzsec):
+    def __init__(self, cvsroot, rcs, dumpfile, fuzzsec, convert_all=False):
         self.cvsroot = cvsroot
         self.rcs = rcs
         self.changesets = dict()
         self.dumpfile = dumpfile
         self.markseq = 0
         self.tags = dict()
+        self.branch_bases = dict()
         self.fuzzsec = fuzzsec
+        self.convert_all = convert_all
 
     def walk(self, module=None):
         p = [self.cvsroot]
@@ -366,15 +425,28 @@ class CvsConv:
 
     def parse_file(self, path):
         rtags = dict()
+        rbranches = dict()
         rcsfile = rcsparse.rcsfile(path)
         branches = {'1': 'HEAD', '1.1.1': 'VENDOR'}
-        for k, v in list(rcsfile.symbols.items()):
+        symbols = list(rcsfile.symbols.items())
+        for k, v in symbols:
             r = v.split('.')
             if len(r) == 3:
                 branches[v] = 'VENDOR'
             elif len(r) >= 3 and r[-2] == '0':
                 branches['.'.join(r[:-2] + r[-1:])] = k
-            if len(r) == 2 and branches[r[0]] == 'HEAD':
+                if self.convert_all:
+                    b = '.'.join(r[:-2])
+                    if b not in rbranches:
+                        rbranches[b] = list()
+                    rbranches[b].append(k)
+
+        for k, v in symbols:
+            r = v.split('.')
+            if len(r) >= 3 and r[-2] == '0':
+                continue
+            branch = branches.get('.'.join(r[:-1]))
+            if branch == 'HEAD' or (self.convert_all and branch is not None):
                 if v not in rtags:
                     rtags[v] = list()
                 rtags[v].append(k)
@@ -415,8 +487,10 @@ class CvsConv:
                     continue
                 last_vendor_status = None
             else:
-                # trunk only
-                continue
+                b = '.'.join(r[:-1])
+                if not self.convert_all or b not in branches:
+                    continue
+                last_vendor_status = None
 
             if self.dumpfile:
                 self.markseq = self.markseq + 1
@@ -443,6 +517,11 @@ class CvsConv:
                     if t not in self.tags or \
                             self.tags[t].max_time < a.max_time:
                         self.tags[t] = a
+            if k in rbranches:
+                for branch in rbranches[k]:
+                    if branch not in self.branch_bases or \
+                            self.branch_bases[branch].max_time < a.max_time:
+                        self.branch_bases[branch] = a
 
 
 def file_path(r, p):
@@ -455,6 +534,204 @@ def file_path(r, p):
     if path.startswith(r):
         path = path[len(r) + 1:]
     return path
+
+
+def is_cvs_branch(branch):
+    return branch not in ('HEAD', 'VENDOR')
+
+
+def git_ref(branch, git_branch):
+    if is_cvs_branch(branch):
+        return 'refs/heads/' + branch
+    return 'refs/heads/' + git_branch
+
+
+def cvs_branch_source(branch, cvs, commit_marks, existing_refs, branch_sources):
+    if branch in branch_sources:
+        return branch_sources[branch]
+
+    base = cvs.branch_bases.get(branch)
+    if base in commit_marks:
+        return ':%d' % commit_marks[base]
+
+    tag = 'refs/tags/%s_BASE' % branch
+    if tag in existing_refs:
+        return tag
+
+    return None
+
+
+def reset_branch(branch, source, initialized_branches):
+    if branch in initialized_branches:
+        return
+
+    output('reset refs/heads/%s' % branch)
+    output('from', source)
+    output('')
+    initialized_branches.add(branch)
+
+
+def reset_tag(tag, source):
+    output('reset refs/tags/%s' % tag)
+    output('from', source)
+    output('')
+
+
+def git_branch_sources(git_dir, git_branch, cvs, existing_refs,
+                       existing_branches, commits, log_encodings):
+    sources = dict()
+    missing = []
+
+    for branch, base in list(cvs.branch_bases.items()):
+        if branch in existing_branches:
+            continue
+
+        key = git_key_from_changeset(base, log_encodings)
+        if key in commits:
+            if len(commits[key]) > 1:
+                raise Exception('ambiguous branch base for %s' % branch)
+            sources[branch] = commits[key][0]
+            continue
+
+        commit = git_commit_before(git_dir, git_branch, int(base.max_time))
+        if commit is not None:
+            sources[branch] = commit
+            continue
+
+        tag = 'refs/tags/%s_BASE' % branch
+        if tag in existing_refs:
+            sources[branch] = tag
+            continue
+
+        missing.append(branch)
+
+    if len(missing) > 0:
+        raise Exception('could not find branch base for %s' %
+                        ', '.join(sorted(missing)))
+
+    return sources
+
+
+def git_tag_sources(git_dir, git_branch, cvs, existing_refs,
+                    existing_branches, commits, log_encodings, last_ctime):
+    sources = dict()
+    missing = []
+
+    for tag, changeset in list(cvs.tags.items()):
+        if 'refs/tags/%s' % tag in existing_refs:
+            continue
+
+        if is_cvs_branch(changeset.branch) and \
+                changeset.branch not in existing_branches:
+            continue
+
+        ref = git_ref(changeset.branch, git_branch)
+        if not is_cvs_branch(changeset.branch):
+            key = git_key_from_changeset(changeset, log_encodings)
+            if key in commits:
+                source = git_commit_from_candidates(
+                    git_dir, ref, commits[key], int(changeset.max_time))
+                if source is None:
+                    raise Exception('ambiguous tag source for %s' % tag)
+                sources[tag] = source
+                continue
+
+        if changeset.max_time > last_ctime:
+            continue
+
+        commit = git_commit_before(git_dir, ref, int(changeset.max_time))
+        if commit is not None:
+            sources[tag] = commit
+            continue
+
+        missing.append(tag)
+
+    if len(missing) > 0:
+        raise Exception('could not find tag source for %s' %
+                        ', '.join(sorted(missing)))
+
+    return sources
+
+
+def git_commit_from_candidates(git_dir, ref, candidates, timestamp):
+    if len(candidates) == 1:
+        return candidates[0]
+
+    commit = git_commit_before(git_dir, ref, timestamp)
+    if commit in candidates:
+        return commit
+    return None
+
+
+def git_commit_map(git_dir, git_branch, email_domain):
+    git = subprocess.Popen(
+        ['git', '--git-dir=' + git_dir, '-c',
+         'i18n.logOutputEncoding=UTF-8', 'log',
+         '--format=%x1e%H%x00%ae%x00%ct%x00%B', git_branch],
+        encoding='utf-8', errors='replace', stdout=subprocess.PIPE)
+    out = git.stdout.read()
+    git.wait()
+    if git.returncode != 0:
+        print("Couldn't exec git", file=sys.stderr)
+        sys.exit(git.returncode)
+
+    commits = dict()
+    for record in out.split('\x1e'):
+        record = record.lstrip('\n')
+        if len(record) == 0:
+            continue
+
+        parts = record.split('\x00', 3)
+        if len(parts) != 4:
+            continue
+
+        commit, author, timestamp, log = parts
+        author = strip_email_domain(author, email_domain)
+        key = (author, int(timestamp), log.rstrip('\n'))
+        if key not in commits:
+            commits[key] = []
+        commits[key].append(commit)
+
+    return commits
+
+
+def git_commit_before(git_dir, git_branch, timestamp):
+    git = subprocess.Popen(
+        ['git', '--git-dir=' + git_dir, 'rev-list', '-1',
+         '--before=@%d' % (timestamp + 1), git_branch],
+        encoding='utf-8', stdout=subprocess.PIPE)
+    outs = git.stdout.readlines()
+    git.wait()
+    if git.returncode != 0:
+        print("Couldn't exec git", file=sys.stderr)
+        sys.exit(git.returncode)
+    if len(outs) == 0:
+        return None
+    return outs[0].strip()
+
+
+def strip_email_domain(author, email_domain):
+    if email_domain is not None and \
+            author.lower().endswith(('@' + email_domain).lower()):
+        return author[:-1 * (1 + len(email_domain))]
+    return author
+
+
+def git_key_from_changeset(changeset, log_encodings):
+    log = rcsparse.rcsfile(changeset.revs[0].path).getlog(
+        changeset.revs[0].rev)
+    return (changeset.author, int(changeset.min_time),
+            decode_log(log, log_encodings).rstrip('\n'))
+
+
+def decode_log(log, log_encodings):
+    for i, e in enumerate(log_encodings):
+        try:
+            how = 'ignore' if i == len(log_encodings) - 1 else 'strict'
+            return log.decode(e, how)
+        except UnicodeError:
+            pass
+    return log.decode(log_encodings[-1], 'ignore')
 
 
 def git_dump_file(path, k, rcs, markseq):
